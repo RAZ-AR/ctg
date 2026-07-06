@@ -1,22 +1,19 @@
-import { addOns, assets, filters, localized, menu, tableNumbers } from "./menuData.js";
+import { addOns, assets, localized, menu as staticMenu, tableNumbers as fallbackTables } from "./menuData.js";
+import { createOrder, createSession, fetchMenu, toggleFavorite as toggleFavoriteRequest } from "./apiClient.js";
 import {
   getCart,
-  getFavorites,
-  getOrCreateLoyalty,
-  getOrders,
   getSavedLanguage,
   saveCart,
-  saveFavorites,
   saveLanguage,
-  saveLoyalty,
-  saveOrders,
 } from "./store.js";
 
 const telegramUser =
   window.Telegram?.WebApp?.initDataUnsafe?.user ||
   { first_name: "Бари", username: "coffee_friend", id: 1042 };
+const telegramInitData = window.Telegram?.WebApp?.initData || "";
 
 const app = document.querySelector("#app");
+const staticMenuById = new Map(staticMenu.map((item) => [item.id, item]));
 
 const supportedLanguages = ["ru", "sr", "en"];
 const telegramLanguage = (telegramUser.language_code || "").slice(0, 2).toLowerCase();
@@ -211,11 +208,15 @@ const i18n = {
 };
 
 const state = {
+  initialized: false,
+  loading: false,
+  menuLoading: false,
+  error: "",
   screen: "home",
   filter: "all",
   language: initialLanguage,
   detailId: null,
-  favorites: getFavorites(),
+  favorites: [],
   cart: getCart(),
   orderMode: "now",
   table: "07",
@@ -224,10 +225,21 @@ const state = {
   pointsToSpend: 0,
   note: "",
   lastOrder: null,
-  orders: getOrders(),
+  orders: [],
+  menu: staticMenu.map(mergeMenuMeta),
+  menuFilters: ["all", "coffee", "cold", "tea", "food"],
+  tableNumbers: fallbackTables,
+  loyalty: {
+    digits: `${telegramUser.id || Date.now()}`.slice(-4).padStart(4, "0"),
+    points: 108,
+    level: "Morning",
+  },
+  profile: {
+    firstName: telegramUser.first_name || "Гость",
+    username: telegramUser.username || "telegram",
+    languageCode: telegramLanguage || "en",
+  },
 };
-
-const loyalty = getOrCreateLoyalty(telegramUser);
 
 function t(key) {
   return i18n[state.language]?.[key] || i18n.en[key] || key;
@@ -241,8 +253,20 @@ function persistCart() {
   saveCart(state.cart);
 }
 
-function persistFavorites() {
-  saveFavorites(state.favorites);
+function mergeMenuMeta(item) {
+  const fallback = staticMenuById.get(item.id) || {};
+  return {
+    ...item,
+    pos: fallback.pos || "50% 50%",
+  };
+}
+
+function setError(message) {
+  state.error = message;
+}
+
+function itemDescription(item) {
+  return item?.description || localize("menu", item?.id);
 }
 
 function money(value) {
@@ -250,7 +274,7 @@ function money(value) {
 }
 
 function itemById(id) {
-  return menu.find((item) => item.id === id);
+  return state.menu.find((item) => item.id === id);
 }
 
 function cartItems() {
@@ -268,7 +292,7 @@ function subtotal() {
 }
 
 function pointsAvailable() {
-  return Math.min(loyalty.points, Math.floor(subtotal() * 0.4));
+  return Math.min(state.loyalty.points, Math.floor(subtotal() * 0.4));
 }
 
 function pointsSpend() {
@@ -280,22 +304,34 @@ function total() {
 }
 
 function filteredMenu() {
-  if (state.filter === "all") return menu;
-  return menu.filter((item) => item.category === state.filter);
+  if (state.filter === "all") return state.menu;
+  return state.menu.filter((item) => item.category === state.filter);
 }
 
 function isFavorite(id) {
   return state.favorites.includes(id);
 }
 
-function toggleFavorite(id) {
+async function toggleFavorite(id) {
+  const previous = state.favorites;
   state.favorites = isFavorite(id) ? state.favorites.filter((itemId) => itemId !== id) : [...state.favorites, id];
-  persistFavorites();
+  render();
+
+  try {
+    const response = await toggleFavoriteRequest(id);
+    state.favorites = response.favorites || [];
+    setError("");
+  } catch {
+    state.favorites = previous;
+    setError("Не получилось обновить избранное.");
+  }
+
   render();
 }
 
 function recommendedFor(id) {
-  return menu.filter((item) => item.id !== id).slice(0, 3);
+  const recommended = state.menu.filter((item) => item.id !== id && item.isRecommended);
+  return (recommended.length ? recommended : state.menu.filter((item) => item.id !== id)).slice(0, 3);
 }
 
 function addItem(id) {
@@ -311,38 +347,119 @@ function removeItem(id) {
   render();
 }
 
-function submitOrder() {
+async function submitOrder() {
   if (!cartCount()) return;
-
-  const order = {
-    id: `SF-${Date.now().toString().slice(-4)}`,
-    user: telegramUser.first_name || telegramUser.username || "Гость",
-    createdAt: new Date().toLocaleString("ru-RU", {
-      day: "2-digit",
-      month: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    }),
-    mode: state.orderMode,
-    target: state.orderMode === "now" ? `${t("table")} ${state.table}` : `${t("inMinutes")} ${state.preorderMinutes} ${t("min")}`,
-    payment: state.payment === "card" ? t("cardPay") : t("cash"),
-    points: pointsSpend(),
-    total: total(),
-    items: cartItems(),
-    note: state.note,
-  };
-
-  loyalty.points = Math.max(0, loyalty.points - order.points) + Math.floor(order.total / 20);
-  saveLoyalty(loyalty);
-  state.lastOrder = order;
-  state.orders = [order, ...state.orders].slice(0, 10);
-  state.cart = {};
-  state.pointsToSpend = 0;
-  state.note = "";
-  persistCart();
-  saveOrders(state.orders);
-  state.screen = "profile";
+  state.loading = true;
   render();
+
+  try {
+    const response = await createOrder({
+      mode: state.orderMode,
+      tableNumber: state.orderMode === "now" ? state.table : null,
+      preorderMinutes: state.orderMode === "preorder" ? state.preorderMinutes : null,
+      paymentMethod: state.payment,
+      pointsToSpend: pointsSpend(),
+      comment: state.note,
+      items: cartItems().map((item) => ({
+        productId: item.id,
+        quantity: item.count,
+      })),
+    });
+
+    const order = {
+      ...response.order,
+      target:
+        response.order.mode === "now"
+          ? `${t("table")} ${response.order.tableNumber}`
+          : `${t("inMinutes")} ${response.order.preorderMinutes} ${t("min")}`,
+      payment: response.order.paymentMethod === "card" ? t("cardPay") : t("cash"),
+      points: response.order.pointsSpent,
+    };
+
+    state.loyalty = response.loyalty;
+    state.lastOrder = order;
+    state.orders = [order, ...state.orders].slice(0, 10);
+    state.cart = {};
+    state.pointsToSpend = 0;
+    state.note = "";
+    persistCart();
+    state.screen = "profile";
+    setError("");
+  } catch {
+    setError("Не получилось оформить заказ.");
+  } finally {
+    state.loading = false;
+    render();
+  }
+}
+
+async function loadMenuForLanguage() {
+  state.menuLoading = true;
+  render();
+
+  try {
+    const response = await fetchMenu(state.language);
+    state.menu = (response.products || []).map(mergeMenuMeta);
+    state.menuFilters = response.filters || state.menuFilters;
+    state.tableNumbers = response.tables || state.tableNumbers;
+    if (!state.tableNumbers.includes(state.table)) {
+      state.table = state.tableNumbers[0] || "01";
+    }
+    setError("");
+  } catch {
+    state.menu = staticMenu.map((item) => ({
+      ...item,
+      description: itemDescription(item),
+      imageUrl: "",
+      isAvailable: true,
+      isRecommended: ["flat", "ice", "salt"].includes(item.id),
+    }));
+    state.menuFilters = ["all", "coffee", "cold", "tea", "food"];
+    state.tableNumbers = fallbackTables;
+    setError("Меню временно загружено из офлайн-версии.");
+  } finally {
+    state.menuLoading = false;
+    render();
+  }
+}
+
+async function boot() {
+  state.loading = true;
+  render();
+
+  try {
+    const session = await createSession(telegramInitData);
+    state.profile = {
+      firstName: session.user?.firstName || telegramUser.first_name || "Гость",
+      username: session.user?.username || telegramUser.username || "telegram",
+      languageCode: session.user?.languageCode || initialLanguage,
+    };
+    state.loyalty = session.loyalty || state.loyalty;
+    state.favorites = session.favorites || [];
+    state.orders = session.orders || [];
+    state.lastOrder = state.orders[0] || null;
+
+    if (!savedLanguage && supportedLanguages.includes(state.profile.languageCode)) {
+      state.language = state.profile.languageCode;
+    }
+
+    await loadMenuForLanguage();
+    state.initialized = true;
+    setError("");
+  } catch {
+    state.initialized = true;
+    setError("Не удалось подключиться к серверу. Показываю локальный режим.");
+    state.menu = staticMenu.map((item) => ({
+      ...item,
+      description: itemDescription(item),
+      imageUrl: "",
+      isAvailable: true,
+      isRecommended: ["flat", "ice", "salt"].includes(item.id),
+    }));
+  } finally {
+    state.loading = false;
+    render();
+  }
 }
 
 function Header() {
@@ -381,7 +498,7 @@ function ProductCard(item) {
         <span class="productText">
           <span>${item.badge}</span>
           <h3>${item.title}</h3>
-          <p>${localize("menu", item.id)}</p>
+          <p>${itemDescription(item)}</p>
         </span>
       </button>
       <div class="productBottom">
@@ -429,7 +546,7 @@ function ProductDetail() {
         <div class="detailCopy">
           <span>${item.badge}</span>
           <h2>${item.title}</h2>
-          <p>${localize("menu", item.id)}. ${t("detailText")}</p>
+          <p>${itemDescription(item)}. ${t("detailText")}</p>
         </div>
         <div class="detailBuy">
           <strong>${money(item.price)}</strong>
@@ -462,7 +579,7 @@ function ProductDetail() {
 }
 
 function Home() {
-  const name = telegramUser.first_name || "guest";
+  const name = state.profile.firstName || telegramUser.first_name || "guest";
   return `
     ${Header()}
 
@@ -477,11 +594,11 @@ function Home() {
     <section class="loyaltyHero">
       <div>
         <span>${t("card")}</span>
-        <strong>${loyalty.digits}</strong>
+        <strong>${state.loyalty.digits}</strong>
       </div>
       <div>
         <span>${t("points")}</span>
-        <strong>${loyalty.points}</strong>
+        <strong>${state.loyalty.points}</strong>
       </div>
     </section>
 
@@ -504,11 +621,13 @@ function Home() {
     </section>
 
     <nav class="filterPills" aria-label="${t("quickFilter")}">
-      ${filters.map(([id]) => `<button class="${state.filter === id ? "active" : ""}" data-filter="${id}">${localize("filters", id)}</button>`).join("")}
+      ${state.menuFilters
+        .map((id) => `<button class="${state.filter === id ? "active" : ""}" data-filter="${id}">${localize("filters", id)}</button>`)
+        .join("")}
     </nav>
 
     <section class="productGrid" aria-label="${t("menu")}">
-      ${filteredMenu().map(ProductCard).join("")}
+      ${state.menuLoading ? `<p class="empty wideEmpty">Loading menu...</p>` : filteredMenu().map(ProductCard).join("")}
     </section>
   `;
 }
@@ -519,7 +638,7 @@ function CartLine(item) {
       ${FoodImage(item, "cartThumb")}
       <div>
         <strong>${item.title}</strong>
-        <small>${localize("menu", item.id)}</small>
+        <small>${itemDescription(item)}</small>
         <div class="qty compact">
           <button data-remove="${item.id}">−</button>
           <b>${item.count}</b>
@@ -551,7 +670,7 @@ function Cart() {
           ? `
             <span class="panelLabel">${t("chooseTable")}</span>
             <div class="tableButtons" aria-label="${t("tableNumber")}">
-              ${tableNumbers
+              ${state.tableNumbers
                 .map((table) => `<button class="${state.table === table ? "active" : ""}" data-table="${table}">${table}</button>`)
                 .join("")}
             </div>
@@ -617,7 +736,7 @@ function Cart() {
       <small>${subtotal() ? `${t("withPoints")}: ${pointsSpend()} ₽` : t("addItems")}</small>
     </section>
 
-    <button class="primaryAction" data-submit ${items.length ? "" : "disabled"}>${t("checkout")}</button>
+    <button class="primaryAction" data-submit ${items.length && !state.loading ? "" : "disabled"}>${state.loading ? "..." : t("checkout")}</button>
   `;
 }
 
@@ -633,18 +752,18 @@ function Profile() {
     <section class="profileHero">
       <div>
         <p>${t("data")}</p>
-        <h1>${telegramUser.first_name || "Гость"}</h1>
-        <span>@${telegramUser.username || "telegram"}</span>
+        <h1>${state.profile.firstName || "Гость"}</h1>
+        <span>@${state.profile.username || "telegram"}</span>
       </div>
     </section>
 
     <section class="loyaltyCard">
       <div>
         <span>${t("loyaltyCard")}</span>
-        <strong>${loyalty.digits}</strong>
+        <strong>${state.loyalty.digits}</strong>
       </div>
       <div class="cardStats">
-        <small>${loyalty.points} ${t("points")}</small>
+        <small>${state.loyalty.points} ${t("points")}</small>
         <small>${state.orders.length} ${t("orders")}</small>
         <small>QR</small>
       </div>
@@ -700,6 +819,11 @@ function BottomBar() {
   `;
 }
 
+function StatusBanner() {
+  if (!state.error) return "";
+  return `<div class="statusBanner">${state.error}</div>`;
+}
+
 function CartDock() {
   if (!cartCount() || state.screen === "cart") return "";
   return `
@@ -715,6 +839,7 @@ function render() {
     state.screen === "cart" ? Cart() : state.screen === "profile" ? Profile() : state.screen === "favorites" ? Favorites() : Home();
   app.innerHTML = `
     <div class="screen">
+      ${StatusBanner()}
       ${view}
     </div>
     ${CartDock()}
@@ -743,7 +868,7 @@ app.addEventListener("click", (event) => {
     render();
   }
   if (favorite) {
-    toggleFavorite(favorite);
+    void toggleFavorite(favorite);
     return;
   }
   if (add) {
@@ -779,6 +904,7 @@ app.addEventListener("click", (event) => {
   if (language && supportedLanguages.includes(language)) {
     state.language = language;
     saveLanguage(language);
+    void loadMenuForLanguage();
     render();
   }
   if (table) {
@@ -789,7 +915,7 @@ app.addEventListener("click", (event) => {
     state.detailId = detail;
     render();
   }
-  if (submit) submitOrder();
+  if (submit) void submitOrder();
 });
 
 app.addEventListener("input", (event) => {
@@ -799,3 +925,4 @@ app.addEventListener("input", (event) => {
 });
 
 render();
+void boot();
