@@ -88,6 +88,18 @@ body {
   display: none;
 }
 
+.statusBanner {
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.74);
+  color: var(--accent-dark);
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.84);
+  backdrop-filter: blur(18px);
+}
+
 .appHeader,
 .subHeader {
   display: flex;
