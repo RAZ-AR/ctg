@@ -3,6 +3,10 @@ import { filters, localized, menu, tableNumbers } from "../../src/menuData.js";
 const allowedLanguages = new Set(["ru", "sr", "en"]);
 const defaultPoints = 108;
 const defaultLevel = "Morning";
+const menuSyncTtlMs = 5 * 60 * 1000;
+
+let lastMenuSyncAt = 0;
+let lastMenuSyncMode = "seed";
 
 function getEnv(name) {
   const value = process.env[name];
@@ -18,6 +22,11 @@ function getBaseUrl() {
 
 function getServiceRoleKey() {
   return getEnv("SUPABASE_SERVICE_ROLE_KEY");
+}
+
+function getOptionalEnv(name) {
+  const value = process.env[name];
+  return value ? String(value).trim() : "";
 }
 
 function normalizeLanguage(languageCode) {
@@ -78,6 +87,159 @@ function inFilter(values) {
   return `in.(${values.map((value) => `"${String(value).replaceAll('"', '\\"')}"`).join(",")})`;
 }
 
+function notInFilter(values) {
+  return `not.${inFilter(values)}`;
+}
+
+function parseBoolean(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["true", "1", "yes", "y"].includes(normalized)) return true;
+  if (["false", "0", "no", "n"].includes(normalized)) return false;
+  return fallback;
+}
+
+function parseInteger(value, fallback = 0) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseCsv(text) {
+  const rows = [];
+  let currentCell = "";
+  let currentRow = [];
+  let inQuotes = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const next = text[index + 1];
+
+    if (char === '"') {
+      if (inQuotes && next === '"') {
+        currentCell += '"';
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === "," && !inQuotes) {
+      currentRow.push(currentCell);
+      currentCell = "";
+      continue;
+    }
+
+    if ((char === "\n" || char === "\r") && !inQuotes) {
+      if (char === "\r" && next === "\n") index += 1;
+      currentRow.push(currentCell);
+      if (currentRow.some((cell) => cell.length > 0)) {
+        rows.push(currentRow);
+      }
+      currentRow = [];
+      currentCell = "";
+      continue;
+    }
+
+    currentCell += char;
+  }
+
+  if (currentCell.length > 0 || currentRow.length > 0) {
+    currentRow.push(currentCell);
+    rows.push(currentRow);
+  }
+
+  return rows;
+}
+
+function mapSheetRowToMenuProduct(headers, row) {
+  const record = Object.fromEntries(headers.map((header, index) => [header, row[index] ?? ""]));
+  if (!record.id) return null;
+
+  return {
+    id: record.id.trim(),
+    category: record.category?.trim() || "coffee",
+    title: record.title?.trim() || record.title_en?.trim() || record.id.trim(),
+    title_ru: record.title_ru?.trim() || record.title?.trim() || record.id.trim(),
+    title_sr: record.title_sr?.trim() || record.title?.trim() || record.id.trim(),
+    title_en: record.title_en?.trim() || record.title?.trim() || record.id.trim(),
+    description_ru: record.description_ru?.trim() || "",
+    description_sr: record.description_sr?.trim() || "",
+    description_en: record.description_en?.trim() || "",
+    price: parseInteger(record.price, 0),
+    image_url: record.image_url?.trim() || "",
+    badge: record.badge?.trim() || null,
+    sort_order: parseInteger(record.sort_order, 0),
+    is_available: parseBoolean(record.is_available, true),
+    is_recommended: parseBoolean(record.is_recommended, false),
+  };
+}
+
+async function replaceMenuProducts(products) {
+  await supabaseRequest("menu_products", {
+    method: "POST",
+    query: {
+      on_conflict: "id",
+      columns:
+        "id,category,title,title_ru,title_sr,title_en,description_ru,description_sr,description_en,price,image_url,badge,sort_order,is_available,is_recommended",
+    },
+    headers: {
+      Prefer: "resolution=merge-duplicates,return=minimal",
+    },
+    body: products,
+  });
+
+  if (products.length) {
+    await supabaseRequest("menu_products", {
+      method: "PATCH",
+      query: {
+        id: notInFilter(products.map((product) => product.id)),
+      },
+      headers: {
+        Prefer: "return=minimal",
+      },
+      body: {
+        is_available: false,
+      },
+    });
+  }
+}
+
+async function syncMenuFromGoogleSheets() {
+  const sheetId = getOptionalEnv("GOOGLE_SHEETS_MENU_ID");
+  if (!sheetId) return false;
+
+  const gid = getOptionalEnv("GOOGLE_SHEETS_MENU_GID") || "0";
+  const csvUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=${encodeURIComponent(gid)}`;
+  const response = await fetch(csvUrl);
+
+  if (!response.ok) {
+    throw new Error(`Google Sheets menu export failed: ${response.status}`);
+  }
+
+  const csvText = await response.text();
+  const rows = parseCsv(csvText);
+  const [headerRow, ...bodyRows] = rows;
+
+  if (!headerRow?.length) {
+    throw new Error("Google Sheets menu export is empty");
+  }
+
+  const headers = headerRow.map((header) => header.trim());
+  const products = bodyRows
+    .map((row) => mapSheetRowToMenuProduct(headers, row))
+    .filter(Boolean);
+
+  if (!products.length) {
+    throw new Error("Google Sheets menu export has no valid products");
+  }
+
+  await replaceMenuProducts(products);
+  lastMenuSyncAt = Date.now();
+  lastMenuSyncMode = "google-sheets";
+  return true;
+}
+
 export function getMenuFilters() {
   return filters.flat().map((key) => key);
 }
@@ -134,22 +296,26 @@ export async function ensureMenuSeeded() {
 
   if (Array.isArray(existing) && existing.length > 0) return;
 
-  await supabaseRequest("menu_products", {
-    method: "POST",
-    query: {
-      on_conflict: "id",
-      columns:
-        "id,category,title,title_ru,title_sr,title_en,description_ru,description_sr,description_en,price,image_url,badge,sort_order,is_available,is_recommended",
-    },
-    headers: {
-      Prefer: "resolution=merge-duplicates,return=minimal",
-    },
-    body: menu.map(mapMenuRow),
-  });
+  await replaceMenuProducts(menu.map(mapMenuRow));
+}
+
+async function ensureMenuCatalogReady() {
+  if (Date.now() - lastMenuSyncAt < menuSyncTtlMs) return;
+
+  try {
+    const synced = await syncMenuFromGoogleSheets();
+    if (synced) return;
+  } catch (error) {
+    console.error("Google Sheets menu sync failed:", error);
+  }
+
+  await ensureMenuSeeded();
+  lastMenuSyncAt = Date.now();
+  lastMenuSyncMode = "seed";
 }
 
 export async function getMenu(language) {
-  await ensureMenuSeeded();
+  await ensureMenuCatalogReady();
 
   const products = await supabaseRequest("menu_products", {
     query: {
@@ -163,11 +329,12 @@ export async function getMenu(language) {
     products: products.map((product) => mapProductForClient(product, language)),
     filters: getMenuFilters(),
     tables: getTableNumbers(),
+    source: lastMenuSyncMode,
   };
 }
 
 export async function getOrCreateUserProfile(telegramUser) {
-  await ensureMenuSeeded();
+  await ensureMenuCatalogReady();
 
   const telegramId = Number(telegramUser.id || 1042);
   const languageCode = normalizeLanguage(telegramUser.language_code);
@@ -339,7 +506,7 @@ export async function toggleFavorite(telegramUser, productId) {
 }
 
 export async function createOrder(telegramUser, payload) {
-  await ensureMenuSeeded();
+  await ensureMenuCatalogReady();
 
   const profile = await getOrCreateUserProfile(telegramUser);
   const requestedItems = Array.isArray(payload.items) ? payload.items : [];
