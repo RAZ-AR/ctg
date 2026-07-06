@@ -1,4 +1,9 @@
-const apiBaseUrl = window.SFAA_API_BASE_URL || "";
+const fallbackApiBaseUrl =
+  window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost"
+    ? "https://ctg-razars-projects.vercel.app"
+    : "";
+
+const apiBaseUrl = window.SFAA_API_BASE_URL || fallbackApiBaseUrl;
 
 async function request(path, options = {}) {
   const response = await fetch(`${apiBaseUrl}${path}`, {
