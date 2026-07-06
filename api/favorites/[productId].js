@@ -1,5 +1,5 @@
-import { toggleFavoriteProduct } from "../_lib/mockState.js";
 import { json, readBody } from "../_lib/response.js";
+import { toggleFavorite } from "../_lib/supabase.js";
 import { extractTelegramUser } from "../_lib/telegram.js";
 
 export default async function handler(req, res) {
@@ -13,6 +13,6 @@ export default async function handler(req, res) {
   if (!productId) return json(res, 400, { error: "Missing product id" });
 
   return json(res, 200, {
-    favorites: toggleFavoriteProduct(telegramUser, productId),
+    favorites: await toggleFavorite(telegramUser, productId),
   });
 }
