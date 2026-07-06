@@ -1,5 +1,5 @@
-import { createMockOrder } from "./_lib/mockState.js";
 import { json, readBody } from "./_lib/response.js";
+import { createOrder } from "./_lib/supabase.js";
 import { extractTelegramUser } from "./_lib/telegram.js";
 
 export default async function handler(req, res) {
@@ -8,5 +8,5 @@ export default async function handler(req, res) {
 
   const body = await readBody(req);
   const telegramUser = extractTelegramUser(req, body);
-  return json(res, 200, createMockOrder(telegramUser, body));
+  return json(res, 200, await createOrder(telegramUser, body));
 }
