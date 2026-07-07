@@ -4,14 +4,16 @@ const fallbackApiBaseUrl =
     : "";
 
 const apiBaseUrl = window.SFAA_API_BASE_URL || fallbackApiBaseUrl;
+const telegramInitData = window.Telegram?.WebApp?.initData || "";
 
 async function request(path, options = {}) {
   const response = await fetch(`${apiBaseUrl}${path}`, {
+    ...options,
     headers: {
       "Content-Type": "application/json",
+      ...(telegramInitData ? { "X-Telegram-Init-Data": telegramInitData } : {}),
       ...options.headers,
     },
-    ...options,
   });
 
   if (!response.ok) {
